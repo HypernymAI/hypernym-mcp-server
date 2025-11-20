@@ -32,7 +32,7 @@ const createAxiosInstance = (baseUrl: string | undefined, apiKey: string | undef
       'Accept': 'application/json',
       'User-Agent': 'hypernym-mcp-server/1.0.0',
     },
-    timeout: 60000, // 60 second timeout for large texts
+    timeout: 660000, // 11 minute default timeout (supports comprehensive mode up to 10 min + buffer)
   });
 
   // Add response interceptor for retrying on certain errors
@@ -81,15 +81,24 @@ const createAxiosInstance = (baseUrl: string | undefined, apiKey: string | undef
             await new Promise(resolve => setTimeout(resolve, retryAfter));
             break;
             
+          case 408: // Request Timeout
           case 500: // Server error
-          case 502: // Bad Gateway  
+          case 502: // Bad Gateway
           case 503: // Service Unavailable
           case 504: // Gateway Timeout
             const backoffDelay = Math.min(1000 * Math.pow(2, retryCount), 10000);
             console.log(`Server error (${status}). Retrying in ${backoffDelay/1000}s (${retryCount + 1}/3)...`);
             await new Promise(resolve => setTimeout(resolve, backoffDelay));
             break;
-            
+
+          case 413: // Payload Too Large - don't retry
+            console.error(`Text exceeds maximum size limit (${status}). Not retrying.`);
+            return Promise.reject(error);
+
+          case 422: // Content policy violation - don't retry
+            console.error(`Content policy violation (${status}). Not retrying.`);
+            return Promise.reject(error);
+
           default:
             // Don't retry other status codes
             return Promise.reject(error);
@@ -157,6 +166,19 @@ interface AnalyzeTextArgs {
   text: string;
   min_semantic_similarity?: number;
   min_compression_ratio?: number;
+  analysis_mode?: 'partial' | 'comprehensive';
+  force_detail_count?: number;
+  force_single_segment?: boolean;
+  timeout?: number;
+  include_embeddings?: boolean;
+  filters?: {
+    purpose?: {
+      exclude?: Array<{
+        semantic_category: string;
+        min_semantic_similarity: number;
+      }>;
+    };
+  };
 }
 
 const isValidAnalyzeTextArgs = (args: any): args is AnalyzeTextArgs =>
@@ -164,7 +186,12 @@ const isValidAnalyzeTextArgs = (args: any): args is AnalyzeTextArgs =>
   args !== null &&
   typeof args.text === 'string' &&
   (args.min_compression_ratio === undefined || typeof args.min_compression_ratio === 'number') &&
-  (args.min_semantic_similarity === undefined || typeof args.min_semantic_similarity === 'number');
+  (args.min_semantic_similarity === undefined || typeof args.min_semantic_similarity === 'number') &&
+  (args.analysis_mode === undefined || args.analysis_mode === 'partial' || args.analysis_mode === 'comprehensive') &&
+  (args.force_detail_count === undefined || typeof args.force_detail_count === 'number') &&
+  (args.force_single_segment === undefined || typeof args.force_single_segment === 'boolean') &&
+  (args.timeout === undefined || typeof args.timeout === 'number') &&
+  (args.include_embeddings === undefined || typeof args.include_embeddings === 'boolean');
 
 class HypernymServer {
   private server: Server;
@@ -252,6 +279,55 @@ class HypernymServer {
                 maximum: 1,
                 default: 0.8,
               },
+              analysis_mode: {
+                type: 'string',
+                enum: ['partial', 'comprehensive'],
+                description: 'Analysis depth: "partial" for quick results (2-5s), "comprehensive" for 60-trial analysis (Northstar only, ~5-6 min uncached, 7-9s cached)',
+                default: 'partial',
+              },
+              force_detail_count: {
+                type: 'number',
+                description: 'Force specific number of covariant details per segment. Standard tier: 3-9, Northstar: unlimited',
+                minimum: 1,
+              },
+              force_single_segment: {
+                type: 'boolean',
+                description: 'Treat entire input as single segment instead of splitting by paragraphs',
+                default: false,
+              },
+              timeout: {
+                type: 'number',
+                description: 'Custom timeout in seconds (Northstar only). Default: 600s, Max: 1200s',
+                minimum: 1,
+                maximum: 1200,
+              },
+              include_embeddings: {
+                type: 'boolean',
+                description: 'Include 768-dimensional embedding vectors in response (Northstar only)',
+                default: false,
+              },
+              filters: {
+                type: 'object',
+                description: 'Semantic filtering to exclude content by category',
+                properties: {
+                  purpose: {
+                    type: 'object',
+                    properties: {
+                      exclude: {
+                        type: 'array',
+                        items: {
+                          type: 'object',
+                          properties: {
+                            semantic_category: { type: 'string' },
+                            min_semantic_similarity: { type: 'number', minimum: 0, maximum: 1 }
+                          },
+                          required: ['semantic_category', 'min_semantic_similarity']
+                        }
+                      }
+                    }
+                  }
+                }
+              },
             },
             required: ['text'],
           },
@@ -280,6 +356,26 @@ class HypernymServer {
                 maximum: 1,
                 default: 0.8,
               },
+              analysis_mode: {
+                type: 'string',
+                enum: ['partial', 'comprehensive'],
+                description: 'Analysis depth: "partial" for quick results, "comprehensive" for 60-trial analysis (Northstar only)',
+                default: 'partial',
+              },
+              force_detail_count: {
+                type: 'number',
+                description: 'Force specific number of covariant details per segment',
+                minimum: 1,
+              },
+              force_single_segment: {
+                type: 'boolean',
+                description: 'Treat entire input as single segment',
+                default: false,
+              },
+              filters: {
+                type: 'object',
+                description: 'Semantic filtering to exclude content by category',
+              },
             },
             required: ['text'],
           },
@@ -306,21 +402,40 @@ class HypernymServer {
             }
 
             try {
-              console.log(`Processing analyze_text request with ${request.params.arguments.text.length} characters`);
-              
-              const response = await this.axiosInstance.post('/analyze_sync', {
-                essay_text: request.params.arguments.text,
-                params: {
-                  min_compression_ratio: request.params.arguments.min_compression_ratio ?? 0.5,
-                  min_semantic_similarity: request.params.arguments.min_semantic_similarity ?? 0.8,
-                },
-              });
+              const args = request.params.arguments;
+              console.log(`Processing analyze_text request with ${args.text.length} characters`);
+
+              // Build params object with all supported parameters
+              const params: Record<string, any> = {
+                min_compression_ratio: args.min_compression_ratio ?? 0.5,
+                min_semantic_similarity: args.min_semantic_similarity ?? 0.8,
+              };
+
+              // Add optional parameters if provided
+              if (args.analysis_mode) params.analysis_mode = args.analysis_mode;
+              if (args.force_detail_count !== undefined) params.force_detail_count = args.force_detail_count;
+              if (args.force_single_segment !== undefined) params.force_single_segment = args.force_single_segment;
+              if (args.timeout !== undefined) params.timeout = args.timeout;
+              if (args.include_embeddings !== undefined) params.include_embeddings = args.include_embeddings;
+
+              // Build request body
+              const requestBody: Record<string, any> = {
+                essay_text: args.text,
+                params,
+              };
+
+              // Add filters if provided
+              if (args.filters) {
+                requestBody.filters = args.filters;
+              }
+
+              const response = await this.axiosInstance.post('/analyze_sync', requestBody);
 
               console.log('Successfully received response from Hypernym API');
-              
+
               // Enhanced logging - log the full response structure
               console.log('API Response structure:', JSON.stringify(response.data, null, 2).substring(0, 500) + '...');
-              
+
               // For the analyze_text tool, return the full analysis with added metadata
               // Make sure we're returning properly formatted JSON with success status
               return {
@@ -353,11 +468,18 @@ class HypernymServer {
                     errorMessage = `Bad request: ${errorMessage}`;
                   } else if (status === 401 || status === 403) {
                     errorMessage = 'Authentication error with Hypernym API. Please check your API key.';
+                  } else if (status === 408) {
+                    errorMessage = 'Request timeout. Consider using a shorter text or increasing timeout (Northstar tier).';
+                  } else if (status === 413) {
+                    errorMessage = `Text exceeds maximum size limit. ${error.response.data?.error || 'Contact hi@hypernym.ai for chunking support.'}`;
+                  } else if (status === 422) {
+                    const details = error.response.data?.error_details;
+                    errorMessage = `Content policy violation: ${details?.message || errorMessage}. ${details?.suggestion || ''}`;
                   } else if (status >= 500) {
                     errorMessage = 'Hypernym API server error. Please try again later.';
                   }
                 }
-                
+
                 return {
                   content: [
                     {
@@ -380,28 +502,55 @@ class HypernymServer {
             }
 
             try {
-              console.log(`Processing semantic_compression request with ${request.params.arguments.text.length} characters`);
-              
-              const response = await this.axiosInstance.post('/analyze_sync', {
-                essay_text: request.params.arguments.text,
-                params: {
-                  min_compression_ratio: request.params.arguments.min_compression_ratio ?? 0.5,
-                  min_semantic_similarity: request.params.arguments.min_semantic_similarity ?? 0.8,
-                },
-              });
+              const args = request.params.arguments;
+              console.log(`Processing semantic_compression request with ${args.text.length} characters`);
+
+              // Build params object with all supported parameters
+              const params: Record<string, any> = {
+                min_compression_ratio: args.min_compression_ratio ?? 0.5,
+                min_semantic_similarity: args.min_semantic_similarity ?? 0.8,
+              };
+
+              // Add optional parameters if provided
+              if (args.analysis_mode) params.analysis_mode = args.analysis_mode;
+              if (args.force_detail_count !== undefined) params.force_detail_count = args.force_detail_count;
+              if (args.force_single_segment !== undefined) params.force_single_segment = args.force_single_segment;
+
+              // Build request body
+              const requestBody: Record<string, any> = {
+                essay_text: args.text,
+                params,
+              };
+
+              // Add filters if provided
+              if (args.filters) {
+                requestBody.filters = args.filters;
+              }
+
+              const response = await this.axiosInstance.post('/analyze_sync', requestBody);
 
               console.log('Successfully received response from Hypernym API');
-              
+
               // For the semantic_compression tool, return only the suggested compressed text
               // Make sure we handle potential API response structure changes gracefully
               let compressedText = '';
-              
+
               // Enhanced logging - log the full response structure
               console.log('API Response structure:', JSON.stringify(response.data, null, 2).substring(0, 500) + '...');
-              
-              if (response.data && response.data.results && response.data.results.response && response.data.results.response.texts) {
-                compressedText = response.data.results.response.texts.suggested || response.data.results.response.texts.compressed || '';
-                
+
+              // API v0.2.4 response structure: { metadata, request, response: { texts: { compressed, suggested }, segments } }
+              if (response.data && response.data.response && response.data.response.texts) {
+                compressedText = response.data.response.texts.suggested || response.data.response.texts.compressed || '';
+
+                // Get metrics from segments if available
+                const segments = response.data.response.segments || [];
+                const avgCompressionRatio = segments.length > 0
+                  ? segments.reduce((sum: number, seg: any) => sum + (seg.compression_ratio || 0), 0) / segments.length
+                  : undefined;
+                const avgSimilarity = segments.length > 0
+                  ? segments.reduce((sum: number, seg: any) => sum + (seg.semantic_similarity || 0), 0) / segments.length
+                  : undefined;
+
                 // Include detailed response information for debugging
                 return {
                   content: [
@@ -411,8 +560,11 @@ class HypernymServer {
                         compressed_text: compressedText,
                         success: true,
                         metrics: {
-                          compression_ratio: response.data.results.response.metrics?.compression_ratio,
-                          semantic_similarity: response.data.results.response.metrics?.semantic_similarity
+                          avg_compression_ratio: avgCompressionRatio,
+                          avg_semantic_similarity: avgSimilarity,
+                          segments_count: segments.length,
+                          filters_applied: response.data.metadata?.filters_applied,
+                          excluded_segments_count: response.data.metadata?.excluded_segments_count
                         },
                         status: response.status,
                         message: "Successfully compressed text"
@@ -426,10 +578,10 @@ class HypernymServer {
               }
             } catch (error) {
               console.error('Error in semantic_compression tool:', error);
-              
+
               if (axios.isAxiosError(error)) {
                 let errorMessage = error.response?.data?.message || error.response?.data?.error || error.message;
-                
+
                 // Add more descriptive messages for common errors
                 if (error.response) {
                   const status = error.response.status || 0;
@@ -441,11 +593,18 @@ class HypernymServer {
                     errorMessage = `Bad request: ${errorMessage}`;
                   } else if (status === 401 || status === 403) {
                     errorMessage = 'Authentication error with Hypernym API. Please check your API key.';
+                  } else if (status === 408) {
+                    errorMessage = 'Request timeout. Consider using a shorter text or increasing timeout (Northstar tier).';
+                  } else if (status === 413) {
+                    errorMessage = `Text exceeds maximum size limit. ${error.response.data?.error || 'Contact hi@hypernym.ai for chunking support.'}`;
+                  } else if (status === 422) {
+                    const details = error.response.data?.error_details;
+                    errorMessage = `Content policy violation: ${details?.message || errorMessage}. ${details?.suggestion || ''}`;
                   } else if (status >= 500) {
                     errorMessage = 'Hypernym API server error. Please try again later.';
                   }
                 }
-                
+
                 return {
                   content: [
                     {
@@ -685,13 +844,14 @@ class HypernymServer {
               
               // Return just the compressed text as per MCP format
               let compressedText = '';
-              
-              if (response.data && response.data.results && response.data.results.response && response.data.results.response.texts) {
-                compressedText = response.data.results.response.texts.suggested || response.data.results.response.texts.compressed || '';
+
+              // API v0.2.4 response structure: { metadata, request, response: { texts: { compressed, suggested }, segments } }
+              if (response.data && response.data.response && response.data.response.texts) {
+                compressedText = response.data.response.texts.suggested || response.data.response.texts.compressed || '';
               } else {
                 console.warn('Unexpected API response structure in HTTP handler');
               }
-              
+
               return res.json({
                 jsonrpc: "2.0",
                 id: mcpRequest.id,
